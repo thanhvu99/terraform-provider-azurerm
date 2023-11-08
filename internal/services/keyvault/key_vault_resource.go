@@ -272,7 +272,6 @@ func resourceKeyVaultCreate(d *pluginsdk.ResourceData, meta interface{}) error {
 	}
 
 	// if so, does the user want us to recover it?
-
 	recoverSoftDeletedKeyVault := false
 	if !response.WasNotFound(softDeletedKeyVault.HttpResponse) && !response.WasStatusCode(softDeletedKeyVault.HttpResponse, http.StatusForbidden) {
 		if !meta.(*clients.Client).Features.KeyVault.RecoverSoftDeletedKeyVaults {
@@ -281,6 +280,12 @@ func resourceKeyVaultCreate(d *pluginsdk.ResourceData, meta interface{}) error {
 		}
 
 		recoverSoftDeletedKeyVault = true
+	}
+
+	isPublic := d.Get("public_network_access_enabled").(bool)
+	contactRaw := d.Get("contact").(*pluginsdk.Set).List()
+	if !isPublic && len(contactRaw) > 0 {
+		return fmt.Errorf("`contact` cannot be specified when `public_network_access_enabled` is set to `false`")
 	}
 
 	tenantUUID := d.Get("tenant_id").(string)
@@ -321,7 +326,7 @@ func resourceKeyVaultCreate(d *pluginsdk.ResourceData, meta interface{}) error {
 		Tags: tags.Expand(t),
 	}
 
-	if d.Get("public_network_access_enabled").(bool) {
+	if isPublic {
 		parameters.Properties.PublicNetworkAccess = utils.String("Enabled")
 	} else {
 		parameters.Properties.PublicNetworkAccess = utils.String("Disabled")
@@ -375,27 +380,35 @@ func resourceKeyVaultCreate(d *pluginsdk.ResourceData, meta interface{}) error {
 	d.SetId(id.ID())
 	meta.(*clients.Client).KeyVault.AddToCache(id, vaultUri)
 
-	log.Printf("[DEBUG] Waiting for %s to become available", id)
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return fmt.Errorf("internal-error: context had no deadline")
-	}
-	stateConf := &pluginsdk.StateChangeConf{
-		Pending:                   []string{"pending"},
-		Target:                    []string{"available"},
-		Refresh:                   keyVaultRefreshFunc(vaultUri),
-		Delay:                     30 * time.Second,
-		PollInterval:              10 * time.Second,
-		ContinuousTargetOccurence: 10,
-		Timeout:                   time.Until(deadline),
-	}
-	if _, err := stateConf.WaitForStateContext(ctx); err != nil {
-		return fmt.Errorf("waiting for %s to become available: %s", id, err)
+	if !isPublic {
+		// Since the Data Plane API isn't available we can't hit this endpoint to confirm that it's
+		// available / the DNS has finished replicating - as such users provisioning a Key Vault
+		// with Public Network Access disabled, particularly when recreating the Key Vault, are
+		// likely to encounter issues using this right away (especially via Private Link), but
+		// there's not a lot we can do about that since the Service is returning that it's provisioned
+		// before it's actually finished doing so.
+		log.Printf("[DEBUG] Waiting for %s to become available", id)
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			return fmt.Errorf("internal-error: context had no deadline")
+		}
+		stateConf := &pluginsdk.StateChangeConf{
+			Pending:                   []string{"pending"},
+			Target:                    []string{"available"},
+			Refresh:                   keyVaultRefreshFunc(vaultUri),
+			Delay:                     30 * time.Second,
+			PollInterval:              10 * time.Second,
+			ContinuousTargetOccurence: 10,
+			Timeout:                   time.Until(deadline),
+		}
+		if _, err := stateConf.WaitForStateContext(ctx); err != nil {
+			return fmt.Errorf("waiting for %s to become available: %s", id, err)
+		}
 	}
 
-	if v, ok := d.GetOk("contact"); ok {
+	if len(contactRaw) > 0 {
 		contacts := dataplane.Contacts{
-			ContactList: expandKeyVaultCertificateContactList(v.(*pluginsdk.Set).List()),
+			ContactList: expandKeyVaultCertificateContactList(contactRaw),
 		}
 		if _, err := dataPlaneClient.SetCertificateContacts(ctx, vaultUri, contacts); err != nil {
 			return fmt.Errorf("failed to set Contacts for %s: %+v", id, err)
@@ -430,6 +443,11 @@ func resourceKeyVaultUpdate(d *pluginsdk.ResourceData, meta interface{}) error {
 	}
 	if existing.Model == nil {
 		return fmt.Errorf("retrieving %s: `properties` was nil", *id)
+	}
+
+	isPublic := true
+	if model := existing.Model; model != nil && model.Properties.PublicNetworkAccess != nil {
+		isPublic = strings.EqualFold(*model.Properties.PublicNetworkAccess, "Enabled")
 	}
 
 	update := vaults.VaultPatchParameters{}
@@ -537,7 +555,8 @@ func resourceKeyVaultUpdate(d *pluginsdk.ResourceData, meta interface{}) error {
 			update.Properties = &vaults.VaultPatchProperties{}
 		}
 
-		if d.Get("public_network_access_enabled").(bool) {
+		isPublic = d.Get("public_network_access_enabled").(bool)
+		if isPublic {
 			update.Properties.PublicNetworkAccess = utils.String("Enabled")
 		} else {
 			update.Properties.PublicNetworkAccess = utils.String("Disabled")
@@ -594,6 +613,9 @@ func resourceKeyVaultUpdate(d *pluginsdk.ResourceData, meta interface{}) error {
 	}
 
 	if d.HasChange("contact") {
+		if isPublic {
+			return fmt.Errorf("`contact` cannot be specified when `public_network_access_enabled` is set to `false`")
+		}
 		contacts := dataplane.Contacts{
 			ContactList: expandKeyVaultCertificateContactList(d.Get("contact").(*pluginsdk.Set).List()),
 		}
@@ -644,18 +666,28 @@ func resourceKeyVaultRead(d *pluginsdk.ResourceData, meta interface{}) error {
 	}
 
 	vaultUri := ""
-	if resp.Model != nil && resp.Model.Properties.VaultUri != nil {
-		vaultUri = *resp.Model.Properties.VaultUri
+	isPublic := true
+	if model := resp.Model; model != nil {
+		if model.Properties.VaultUri != nil {
+			vaultUri = *model.Properties.VaultUri
+		}
+		if model.Properties.PublicNetworkAccess != nil {
+			isPublic = strings.EqualFold(*model.Properties.PublicNetworkAccess, "Enabled")
+		}
 	}
 	if vaultUri != "" {
 		meta.(*clients.Client).KeyVault.AddToCache(*id, vaultUri)
 	}
 
-	contactsResp, err := dataplaneClient.GetCertificateContacts(ctx, vaultUri)
-	if err != nil {
-		if !utils.ResponseWasForbidden(contactsResp.Response) && !utils.ResponseWasNotFound(contactsResp.Response) {
-			return fmt.Errorf("retrieving `contact` for KeyVault: %+v", err)
+	var contactsResp *dataplane.Contacts
+	if isPublic {
+		contacts, err := dataplaneClient.GetCertificateContacts(ctx, vaultUri)
+		if err != nil {
+			if !utils.ResponseWasForbidden(contacts.Response) && !utils.ResponseWasNotFound(contacts.Response) {
+				return fmt.Errorf("retrieving `contact` for KeyVault: %+v", err)
+			}
 		}
+		contactsResp = &contacts
 	}
 
 	d.Set("name", id.VaultName)
@@ -713,7 +745,6 @@ func resourceKeyVaultRead(d *pluginsdk.ResourceData, meta interface{}) error {
 		if err := tags.FlattenAndSet(d, model.Tags); err != nil {
 			return fmt.Errorf("setting `tags`: %+v", err)
 		}
-
 	}
 
 	return nil
@@ -932,9 +963,9 @@ func flattenKeyVaultNetworkAcls(input *vaults.NetworkRuleSet) []interface{} {
 	}
 }
 
-func flattenKeyVaultCertificateContactList(input dataplane.Contacts) []interface{} {
+func flattenKeyVaultCertificateContactList(input *dataplane.Contacts) []interface{} {
 	results := make([]interface{}, 0)
-	if input.ContactList == nil {
+	if input == nil || input.ContactList == nil {
 		return results
 	}
 
